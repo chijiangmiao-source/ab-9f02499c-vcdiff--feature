@@ -10,6 +10,12 @@
 - 失败时给出错误码与**首个原始偏移**，且不保留任何部分输出；
 - 可一键清空输入与结论。
 
+另提供**字典对照**：粘贴候选 Base64 字典（≤ 64 KiB）后一次对照提交，系统以同一载荷
+分别用基准字典与候选字典运行同一严格解码，并排展示两侧输出长度、SHA-256 与是否
+完全一致；两侧都成功时按最终输出偏移列出连续差异区间（含两侧字节的十六进制摘要与
+首个不同位置），完全一致则明确显示无差异。候选侧超限 / Base64 非法 / 解码失败时，
+只报告候选侧的结构化错误与原始偏移，基准侧结论保留，且不产生任何差异结果。
+
 ## 严格接受规则（RFC 3284）
 
 | 规则 | 实现 |
@@ -31,13 +37,14 @@
 
 ```
 src/vcdiff.js          RFC 3284 严格解码器（默认码表、地址缓存、证据收集）
-src/server.js          零依赖 HTTP 服务（/healthz、/、/api/decode、/api/reset）
+src/server.js          零依赖 HTTP 服务（/healthz、/、/api/decode、/api/compare、/api/reset）
 static/index.html      校验台页面（原生 JS，无外部资源）
 test/vcdiff.test.js    解码器单元/拒绝用例（50 项）
 test/server.test.js    接口测试
+test/compare.test.js   字典对照接口与差异区间测试
 test/helpers/encoder.js 测试用最小 VCDIFF 编码器（可构造畸形流）
 fixtures/golden/       open-vcdiff 参考实现生成的黄金向量（7 组）
-fixtures/samples.json  页面/冒烟所用样本（含失败偏移）
+fixtures/samples.json  页面/冒烟所用样本（含失败偏移与对照预期）
 scripts/generate-samples.js 重新生成样本
 scripts/check-syntax.js     构建检查（node --check 全部 JS）
 scripts/verify.js           单元测试 + 构建检查 + HTTP 冒烟，退出码结束
@@ -109,5 +116,51 @@ echo "exit=$?"
 ```json
 { "ok": false, "error": { "code": "COPY_NOT_GENERATED", "message": "…", "offset": 39 } }
 ```
+
+`POST /api/compare`（字典对照：同一载荷，基准 vs 候选字典各解码一次）
+
+```json
+{
+  "deltaBase64": "1sPExAAAAA...",
+  "dictionaryBase64": "MDEy...",
+  "candidateDictionaryBase64": "MDEy..."
+}
+```
+
+成功 `200`（`deltaBase64` / `dictionaryBase64` 的缺失、超限、非法 Base64 仍按
+`/api/decode` 语义返回 `400/413`）：
+
+```json
+{
+  "ok": true,
+  "baseline":  { "ok": true, "length": 37, "sha256": "ddd5ab03…" },
+  "candidate": { "ok": true, "length": 37, "sha256": "9c4f2c…" },
+  "identical": false,
+  "diff": {
+    "identical": false,
+    "firstOffset": 17,
+    "rangeCount": 2,
+    "differingBytes": 2,
+    "rangesTruncated": false,
+    "ranges": [
+      { "start": 17, "end": 18, "firstOffset": 17,
+        "baseline":  { "bytes": 1, "hex": "45", "truncated": false },
+        "candidate": { "bytes": 1, "hex": "5a", "truncated": false } },
+      { "start": 19, "end": 20, "firstOffset": 19,
+        "baseline":  { "bytes": 1, "hex": "4c", "truncated": false },
+        "candidate": { "bytes": 1, "hex": "5a", "truncated": false } }
+    ]
+  },
+  "limits": { "maxOutputBytes": 524288, "maxWindows": 8,
+              "maxDiffRanges": 256, "diffHexPreviewBytes": 32 }
+}
+```
+
+- 两侧输出完全一致时 `identical: true`、`diff.ranges: []`、`diff.firstOffset: null`。
+- 差异区间按最终输出偏移升序；每区间给出两侧字节的十六进制摘要（每侧最多
+  32 字节，超出时 `truncated: true` 且 `bytes` 给出完整长度）与首个不同位置。
+- 候选字典超限 / Base64 非法 / 解码失败时响应仍为 `200`：候选侧携带既有结构化
+  错误（`code` / `message` / `offset`），基准侧结论保留，`identical` 与 `diff`
+  为 `null`——失败侧的任何部分输出都不会成为差异结果。基准侧失败时对称处理。
 
 另有 `GET /healthz → {"status":"ok"}` 与 `POST /api/reset → {"ok":true}`。

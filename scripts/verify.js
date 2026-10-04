@@ -111,6 +111,61 @@ async function smokeTest(baseUrl) {
   });
   expect((await b64Resp.json()).error.code === 'BAD_BASE64', 'malformed Base64 rejected');
 
+  // --- dictionary compare: same delta, baseline vs candidate dictionary ------
+  const cmpResp = await fetch(`${baseUrl}/api/compare`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      deltaBase64: samples.valid.deltaBase64,
+      dictionaryBase64: samples.dictionaryBase64,
+      candidateDictionaryBase64: samples.compare.candidateDictionaryBase64,
+    }),
+  });
+  expect(cmpResp.status === 200, `compare HTTP 200 (got ${cmpResp.status})`);
+  const cmp = await cmpResp.json();
+  const cmpExp = samples.compare.expectedDiff;
+  expect(cmp.ok === true && cmp.baseline.ok === true && cmp.candidate.ok === true,
+    'compare: both sides decoded');
+  expect(cmp.baseline.sha256 === samples.valid.expectedSha256, 'compare: baseline sha256 matches');
+  expect(cmp.candidate.sha256 === samples.compare.expectedCandidateSha256,
+    'compare: candidate sha256 matches');
+  expect(cmp.identical === false && cmp.diff.firstOffset === cmpExp.firstOffset &&
+    cmp.diff.rangeCount === cmpExp.rangeCount,
+    `compare: first difference at ${cmp.diff?.firstOffset}, ${cmp.diff?.rangeCount} ranges`);
+  expect(JSON.stringify(cmp.diff.ranges.map((r) => [r.start, r.end, r.baseline.hex, r.candidate.hex])) ===
+    JSON.stringify(cmpExp.ranges.map((r) => [r.start, r.end, r.baselineHex, r.candidateHex])),
+    'compare: diff ranges with hex digests match the fixture');
+
+  // Identical dictionaries -> explicitly no differences.
+  const sameResp = await fetch(`${baseUrl}/api/compare`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      deltaBase64: samples.valid.deltaBase64,
+      dictionaryBase64: samples.dictionaryBase64,
+      candidateDictionaryBase64: samples.dictionaryBase64,
+    }),
+  });
+  const same = await sameResp.json();
+  expect(same.identical === true && same.diff.identical === true && same.diff.ranges.length === 0,
+    'compare: identical dictionaries report no differences');
+
+  // Candidate-side failure: structured error, baseline stays, no diff.
+  const badCandResp = await fetch(`${baseUrl}/api/compare`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      deltaBase64: samples.valid.deltaBase64,
+      dictionaryBase64: samples.dictionaryBase64,
+      candidateDictionaryBase64: 'not-base64!!',
+    }),
+  });
+  const badCand = await badCandResp.json();
+  expect(badCandResp.status === 200 && badCand.baseline.ok === true &&
+    badCand.candidate.ok === false && badCand.candidate.error.code === 'BAD_BASE64' &&
+    badCand.diff === null,
+    'compare: candidate failure keeps baseline conclusion and yields no diff');
+
   // --- reset endpoint --------------------------------------------------------
   const resetResp = await fetch(`${baseUrl}/api/reset`, { method: 'POST' });
   expect(resetResp.status === 200, 'POST /api/reset -> 200');

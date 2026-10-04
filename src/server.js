@@ -15,6 +15,12 @@ const PAGE_HTML = readFileSync(join(here, '..', 'static', 'index.html'));
 export const MAX_DELTA_BASE64_BYTES = 128 * 1024;
 export const MAX_DICT_BASE64_BYTES = 64 * 1024;
 
+// Dictionary-compare (/api/compare) reporting bounds: at most this many
+// contiguous difference ranges are listed, and each side of a range shows at
+// most this many bytes of hex (the full lengths are always reported).
+export const MAX_DIFF_RANGES = 256;
+export const DIFF_HEX_PREVIEW_BYTES = 32;
+
 const STRICT_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 function json(res, status, body) {
@@ -115,6 +121,181 @@ export function handleDecode(rawBody) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Dictionary compare (/api/compare)
+//
+// The same delta payload is decoded twice with the existing strict decoder:
+// once against the baseline dictionary, once against a candidate dictionary.
+// Each side reports its own outcome; a side that fails keeps the structured
+// error (code/message/raw offset) and never contributes partial output to
+// the difference report.
+// ---------------------------------------------------------------------------
+
+function sideFailure(err) {
+  return { ok: false, error: { code: err.code, message: err.message, offset: err.offset } };
+}
+
+function runDecodeSide(delta, dictionary) {
+  try {
+    const result = decodeVcdiff(delta, dictionary);
+    return {
+      ok: true,
+      length: result.length,
+      sha256: createHash('sha256').update(result.output).digest('hex'),
+      // Internal only: fed to diffOutputs, never serialised into a response.
+      output: result.output,
+    };
+  } catch (err) {
+    if (!(err instanceof VcdiffError)) throw err;
+    return sideFailure(err);
+  }
+}
+
+// Strips the internal raw output before a side goes onto the wire.
+function publicSide(side) {
+  if (!side.ok) return { ok: false, error: side.error };
+  return { ok: true, length: side.length, sha256: side.sha256 };
+}
+
+// Contiguous difference ranges between two complete outputs, addressed by
+// final output offset. Ranges are maximal runs of differing positions; when
+// one output is a prefix of the other, the tail beyond the shorter length is
+// a final range (merged with a preceding range when adjacent).
+export function diffOutputs(baseline, candidate, options = {}) {
+  const maxRanges = options.maxRanges ?? MAX_DIFF_RANGES;
+  const previewBytes = options.previewBytes ?? DIFF_HEX_PREVIEW_BYTES;
+
+  const common = Math.min(baseline.length, candidate.length);
+  const spans = [];
+  let i = 0;
+  while (i < common) {
+    if (baseline[i] === candidate[i]) {
+      i += 1;
+      continue;
+    }
+    const start = i;
+    while (i < common && baseline[i] !== candidate[i]) i += 1;
+    spans.push([start, i]);
+  }
+  if (baseline.length !== candidate.length) {
+    const end = Math.max(baseline.length, candidate.length);
+    const last = spans[spans.length - 1];
+    if (last && last[1] === common) last[1] = end;
+    else spans.push([common, end]);
+  }
+
+  const sideView = (buf, start, end) => {
+    const from = Math.min(start, buf.length);
+    const to = Math.min(end, buf.length);
+    const available = Math.max(0, to - from);
+    const shown = Math.min(available, previewBytes);
+    return {
+      bytes: available,
+      hex: Buffer.from(buf.subarray(from, from + shown)).toString('hex'),
+      truncated: available > shown,
+    };
+  };
+
+  let differingBytes = 0;
+  for (const [start, end] of spans) differingBytes += end - start;
+
+  return {
+    identical: spans.length === 0,
+    firstOffset: spans.length === 0 ? null : spans[0][0],
+    rangeCount: spans.length,
+    differingBytes,
+    rangesTruncated: spans.length > maxRanges,
+    ranges: spans.slice(0, maxRanges).map(([start, end]) => ({
+      start,
+      end,
+      firstOffset: start,
+      baseline: sideView(baseline, start, end),
+      candidate: sideView(candidate, start, end),
+    })),
+  };
+}
+
+export function handleCompare(rawBody) {
+  let parsed;
+  try {
+    parsed = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    throw new VcdiffError('BAD_JSON', 'request body must be a JSON object');
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new VcdiffError('BAD_REQUEST', 'request body must be a JSON object');
+  }
+
+  const { deltaBase64, dictionaryBase64, candidateDictionaryBase64 } = parsed;
+  if (typeof deltaBase64 !== 'string') {
+    throw new VcdiffError('BAD_REQUEST', 'field "deltaBase64" is required');
+  }
+  if (deltaBase64.length > MAX_DELTA_BASE64_BYTES) {
+    throw new VcdiffError(
+      'PAYLOAD_TOO_LARGE',
+      `delta Base64 payload exceeds ${MAX_DELTA_BASE64_BYTES} bytes`,
+    );
+  }
+  const dictText = typeof dictionaryBase64 === 'string' ? dictionaryBase64 : '';
+  if (dictText.length > MAX_DICT_BASE64_BYTES) {
+    throw new VcdiffError(
+      'PAYLOAD_TOO_LARGE',
+      `dictionary Base64 payload exceeds ${MAX_DICT_BASE64_BYTES} bytes`,
+    );
+  }
+
+  // The shared payload (delta + baseline dictionary) is validated up front
+  // with exactly the same request-level semantics as /api/decode.
+  const delta = decodeBase64Field(deltaBase64, 'deltaBase64');
+  const dictionary = decodeBase64Field(dictText, 'dictionaryBase64');
+
+  const baseline = runDecodeSide(delta, dictionary);
+
+  // Candidate-side problems (oversize, invalid Base64, decode failure) are
+  // reported inside the candidate slot; the baseline conclusion stays visible.
+  let candidate;
+  const candidateText =
+    typeof candidateDictionaryBase64 === 'string' ? candidateDictionaryBase64 : '';
+  try {
+    if (candidateText.length > MAX_DICT_BASE64_BYTES) {
+      throw new VcdiffError(
+        'PAYLOAD_TOO_LARGE',
+        `candidate dictionary Base64 payload exceeds ${MAX_DICT_BASE64_BYTES} bytes`,
+      );
+    }
+    candidate = runDecodeSide(
+      delta,
+      decodeBase64Field(candidateText, 'candidateDictionaryBase64'),
+    );
+  } catch (err) {
+    if (!(err instanceof VcdiffError)) throw err;
+    candidate = sideFailure(err);
+  }
+
+  // The difference report exists only when both sides decoded completely; a
+  // failed side never contributes partial output to it.
+  let identical = null;
+  let diff = null;
+  if (baseline.ok && candidate.ok) {
+    diff = diffOutputs(baseline.output, candidate.output);
+    identical = diff.identical;
+  }
+
+  return {
+    ok: true,
+    baseline: publicSide(baseline),
+    candidate: publicSide(candidate),
+    identical,
+    diff,
+    limits: {
+      maxOutputBytes: MAX_OUTPUT_BYTES,
+      maxWindows: MAX_WINDOWS,
+      maxDiffRanges: MAX_DIFF_RANGES,
+      diffHexPreviewBytes: DIFF_HEX_PREVIEW_BYTES,
+    },
+  };
+}
+
 export function createApp() {
   return createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -147,6 +328,39 @@ export function createApp() {
       req.on('end', () => {
         try {
           const answer = handleDecode(Buffer.concat(chunks));
+          return json(res, 200, answer);
+        } catch (err) {
+          if (err instanceof VcdiffError) {
+            const status = err.code === 'PAYLOAD_TOO_LARGE' ? 413 : 400;
+            return json(res, status, {
+              ok: false,
+              error: { code: err.code, message: err.message, offset: err.offset },
+            });
+          }
+          return json(res, 500, {
+            ok: false,
+            error: { code: 'INTERNAL', message: 'internal error', offset: null },
+          });
+        }
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/compare') {
+      const chunks = [];
+      let size = 0;
+      req.on('data', (chunk) => {
+        size += chunk.length;
+        // Two dictionary fields travel in this body (baseline + candidate).
+        if (size > MAX_DELTA_BASE64_BYTES + 2 * MAX_DICT_BASE64_BYTES + 4096) {
+          req.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on('end', () => {
+        try {
+          const answer = handleCompare(Buffer.concat(chunks));
           return json(res, 200, answer);
         } catch (err) {
           if (err instanceof VcdiffError) {

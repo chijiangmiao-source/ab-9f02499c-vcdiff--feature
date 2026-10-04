@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-03T01:58:22.038Z",
+  "generatedAt": "2026-10-04T13:58:19.802Z",
   "dictionaryBase64": "MDEyMzQ1Njc4OS1IRUxMTy1ESUNU",
   "valid": {
     "deltaBase64": "1sPEAAABFQASGAAGBQJXT1JMRCF7BhQABAALAgsFDw0AAgUDPj4VMwEDdQUFBQ==",
@@ -20,5 +20,28 @@
   "truncated": {
     "deltaBase64": "1sPEAAABFQASGAAGBQJXT1JMRCF7BhQABAALAgsFDw0AAgUDPj4VMwEDdQ==",
     "expectedCode": "TRUNCATED"
+  },
+  "compare": {
+    "candidateDictionaryBase64": "MDEyMzQ1Njc4OS1IWkxaTy1ESUNU",
+    "expectedCandidateSha256": "530cfc3f80d0e09dfca3bf73607b18f76a1aa803157f603ae8dbc8a70ff74e05",
+    "expectedDiff": {
+      "identical": false,
+      "firstOffset": 17,
+      "rangeCount": 2,
+      "ranges": [
+        {
+          "start": 17,
+          "end": 18,
+          "baselineHex": "45",
+          "candidateHex": "5a"
+        },
+        {
+          "start": 19,
+          "end": 20,
+          "baselineHex": "4c",
+          "candidateHex": "5a"
+        }
+      ]
+    }
   }
 }

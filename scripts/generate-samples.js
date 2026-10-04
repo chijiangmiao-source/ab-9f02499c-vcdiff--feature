@@ -128,6 +128,22 @@ if (!rangeError || rangeError.code !== 'SOURCE_RANGE') {
   throw new Error(`expected SOURCE_RANGE, got ${rangeError}`);
 }
 
+// ---- compare sample: same delta, candidate dictionary with two edits ------
+// Candidate dictionary differs at indices 12 ('E'->'Z') and 14 ('L'->'Z').
+// Window 1 copies dictionary [11, 15) into output [16, 20), so the final
+// outputs differ exactly at offsets 17 and 19; window 2 is unaffected.
+const candidateDictionary = encoder.encode('0123456789-HZLZO-DICT');
+const candidateResult = decodeVcdiff(validDelta, candidateDictionary);
+const expectedCandidateOutput = expectedOutput.slice();
+expectedCandidateOutput[17] = 0x5a; // 'E' -> 'Z'
+expectedCandidateOutput[19] = 0x5a; // 'L' -> 'Z'
+if (
+  candidateResult.length !== expectedCandidateOutput.length ||
+  !candidateResult.output.every((b, i) => b === expectedCandidateOutput[i])
+) {
+  throw new Error('compare sample mismatch');
+}
+
 const sample = {
   generatedAt: new Date().toISOString(),
   dictionaryBase64: b64(dictionary),
@@ -151,6 +167,19 @@ const sample = {
     deltaBase64: b64(truncatedDelta),
     expectedCode: 'TRUNCATED',
   },
+  compare: {
+    candidateDictionaryBase64: b64(candidateDictionary),
+    expectedCandidateSha256: sha256(candidateResult.output),
+    expectedDiff: {
+      identical: false,
+      firstOffset: 17,
+      rangeCount: 2,
+      ranges: [
+        { start: 17, end: 18, baselineHex: '45', candidateHex: '5a' },
+        { start: 19, end: 20, baselineHex: '4c', candidateHex: '5a' },
+      ],
+    },
+  },
 };
 
 const outDir = join(root, 'fixtures');
@@ -162,3 +191,4 @@ console.log(`  valid      : ${validResult.length} bytes, ${validResult.windows.l
 console.log(`  badCopy    : ${badError.code} at raw offset ${badError.offset}`);
 console.log(`  nonMinimal : ${nmError.code} at raw offset ${nmError.offset}`);
 console.log(`  truncated  : ${truncError.code}`);
+console.log(`  compare    : candidate differs at output offsets 17 and 19 (2 ranges)`);

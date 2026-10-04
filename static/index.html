@@ -32,6 +32,8 @@
   button { border: 0; border-radius: 7px; padding: 9px 18px; font-size: 13.5px; cursor: pointer; }
   button.primary { background: var(--accent); color: #0b1020; font-weight: 600; }
   button.primary:disabled { opacity: .55; cursor: wait; }
+  button.compare { background: var(--warn); color: #0b1020; font-weight: 600; }
+  button.compare:disabled { opacity: .55; cursor: wait; }
   button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
   button.ghost:hover { color: var(--txt); border-color: var(--accent); }
   .rules { margin-top: 16px; font-size: 12px; color: var(--muted); }
@@ -73,7 +75,7 @@
 <body>
 <header>
   <h1>深空归档 · 增量标定片导入校验台</h1>
-  <p>粘贴 Base64 VCDIFF 载荷与基准字典，按 RFC 3284 默认码表解码，核验最终长度 / SHA-256 / 窗口源区间 / 指令证据。解码失败时报告首个原始偏移且不保留任何部分输出。</p>
+  <p>粘贴 Base64 VCDIFF 载荷与基准字典，按 RFC 3284 默认码表解码，核验最终长度 / SHA-256 / 窗口源区间 / 指令证据。解码失败时报告首个原始偏移且不保留任何部分输出。亦可用候选字典做一次对照提交：同一载荷两侧分别解码，按最终输出偏移列出连续差异区间。</p>
 </header>
 
 <main>
@@ -88,8 +90,13 @@
         <span class="lbl"><span>Base64 基准字典（≤ 64 KiB，可留空）</span><span id="dictCount">0 B</span></span>
         <textarea id="dict" spellcheck="false" placeholder="SOURCE 窗口使用的基准字典字节的 Base64" autocomplete="off"></textarea>
       </label>
+      <label class="field">
+        <span class="lbl"><span>候选 Base64 字典（≤ 64 KiB，可留空，仅对照时使用）</span><span id="candCount">0 B</span></span>
+        <textarea id="cand" spellcheck="false" placeholder="对照提交时使用的候选字典字节的 Base64；增量载荷保持不变" autocomplete="off"></textarea>
+      </label>
       <div class="btns">
         <button type="submit" class="primary" id="submitBtn">提交真实接口校验</button>
+        <button type="button" class="compare" id="compareBtn">对照提交（基准 vs 候选）</button>
         <button type="button" class="ghost" id="clearBtn">清空输入与结论</button>
       </div>
     </form>
@@ -99,6 +106,7 @@
       <li>整数必须最短编码；三段长度须精确吻合</li>
       <li>COPY 仅允许读取 SOURCE / 前序 TARGET 或当前窗口已生成字节</li>
       <li>地址缓存按窗口维护：<code>SELF / HERE / NEAR×4 / SAME×3</code></li>
+      <li>对照提交：同一载荷分别以基准 / 候选字典解码，按最终输出偏移列出连续差异区间</li>
     </ul>
   </section>
 
@@ -111,8 +119,8 @@
 <script>
 'use strict';
 const $ = (id) => document.getElementById(id);
-const deltaEl = $('delta'), dictEl = $('dict');
-const deltaCount = $('deltaCount'), dictCount = $('dictCount');
+const deltaEl = $('delta'), dictEl = $('dict'), candEl = $('cand');
+const deltaCount = $('deltaCount'), dictCount = $('dictCount'), candCount = $('candCount');
 
 const DELTA_LIMIT = 128 * 1024;
 const DICT_LIMIT = 64 * 1024;
@@ -125,6 +133,7 @@ function updateCounter(el, counter, limit) {
 }
 deltaEl.addEventListener('input', () => updateCounter(deltaEl, deltaCount, DELTA_LIMIT));
 dictEl.addEventListener('input', () => updateCounter(dictEl, dictCount, DICT_LIMIT));
+candEl.addEventListener('input', () => updateCounter(candEl, candCount, DICT_LIMIT));
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
@@ -215,6 +224,70 @@ function renderError(payload) {
   </div>`;
 }
 
+// --- dictionary compare (/api/compare) rendering ----------------------------
+
+function renderCompareSide(title, side) {
+  if (!side || !side.ok) {
+    const e = (side && side.error) || {};
+    const off = (e.offset === null || e.offset === undefined)
+      ? '不适用' : `<span class="offset-pill">首个原始偏移 ${e.offset} (0x${Number(e.offset).toString(16)})</span>`;
+    return `
+    <div class="alert error">
+      <div style="margin-bottom:6px">${title} ✗ <span class="code">${esc(e.code || 'ERROR')}</span> — ${esc(e.message || '解码失败')}</div>
+      <div>${off} <span class="muted">该侧未产生完整输出，不参与差异对照；另一侧结论不受影响。</span></div>
+    </div>`;
+  }
+  return `
+  <div class="summary" style="grid-template-columns: minmax(90px, 130px) 1fr 1fr;">
+    <div class="stat"><div class="k">${title}</div><div class="v" style="color:var(--ok)">✓ 成功</div></div>
+    <div class="stat"><div class="k">输出长度</div><div class="v">${side.length.toLocaleString('en')}</div></div>
+    <div class="stat"><div class="k">SHA-256</div><div class="v" style="font-size:11.5px">${esc(side.sha256)}</div></div>
+  </div>`;
+}
+
+function renderDiffRanges(diff) {
+  if (diff.identical) {
+    return '<div class="alert ok">✓ 对照结论：两侧最终输出<strong>完全一致</strong> —— 无差异区间。</div>';
+  }
+  const rows = diff.ranges.map((r) => {
+    const baseHex = r.baseline.hex ? esc(r.baseline.hex) : '<span class="muted">（无字节）</span>';
+    const candHex = r.candidate.hex ? esc(r.candidate.hex) : '<span class="muted">（无字节）</span>';
+    const baseNote = r.baseline.truncated ? ` <span class="muted">…共 ${r.baseline.bytes} B</span>` : '';
+    const candNote = r.candidate.truncated ? ` <span class="muted">…共 ${r.candidate.bytes} B</span>` : '';
+    return `<tr>
+      <td class="hex">[${r.start}, ${r.end})</td>
+      <td class="num">${r.end - r.start}</td>
+      <td class="num">${r.firstOffset}</td>
+      <td class="hex">${baseHex}${baseNote}</td>
+      <td class="hex">${candHex}${candNote}</td>
+    </tr>`;
+  }).join('');
+  const truncNote = diff.rangesTruncated
+    ? `<div class="muted" style="margin-top:6px">区间过多，仅列出前 ${diff.ranges.length} 个（共 ${diff.rangeCount} 个）。</div>`
+    : '';
+  return `
+  <div class="alert error">✗ 对照结论：两侧输出存在 ${diff.rangeCount} 个连续差异区间（共 ${diff.differingBytes.toLocaleString('en')} 字节），首个不同位置 ${diff.firstOffset}。</div>
+  <table>
+    <thead><tr>
+      <th>输出区间</th><th>长度</th><th>首个不同位置</th><th>基准侧 hex</th><th>候选侧 hex</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  ${truncNote}`;
+}
+
+function renderCompare(data) {
+  const parts = [];
+  parts.push(renderCompareSide('基准字典侧', data.baseline));
+  parts.push(renderCompareSide('候选字典侧', data.candidate));
+  if (data.diff) {
+    parts.push(renderDiffRanges(data.diff));
+  } else {
+    parts.push('<div class="alert error">✗ 对照结论：至少一侧解码失败，未生成任何差异结果（失败侧的部分输出不会参与对照）。</div>');
+  }
+  return parts.join('');
+}
+
 $('form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const btn = $('submitBtn');
@@ -250,11 +323,52 @@ $('form').addEventListener('submit', async (ev) => {
   }
 });
 
+$('compareBtn').addEventListener('click', async () => {
+  const btn = $('compareBtn');
+  const deltaB64 = deltaEl.value.trim();
+  const dictB64 = dictEl.value.trim();
+  const candB64 = candEl.value.trim();
+
+  if (deltaB64.length === 0) {
+    $('result').innerHTML = '<div class="alert error"><span class="code">BAD_REQUEST</span> — 请粘贴 VCDIFF 载荷。</div>';
+    return;
+  }
+  if (deltaB64.length > DELTA_LIMIT || dictB64.length > DICT_LIMIT || candB64.length > DICT_LIMIT) {
+    $('result').innerHTML = '<div class="alert error"><span class="code">PAYLOAD_TOO_LARGE</span> — 输入超过页面允许长度。</div>';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = '对照中…';
+  $('result').innerHTML = '<div class="placeholder">正在调用 /api/compare …</div>';
+  try {
+    const resp = await fetch('/api/compare', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        deltaBase64: deltaB64,
+        dictionaryBase64: dictB64,
+        candidateDictionaryBase64: candB64,
+      }),
+    });
+    const data = await resp.json();
+    $('result').innerHTML = data.ok ? renderCompare(data) : renderError(data);
+  } catch (err) {
+    $('result').innerHTML =
+      `<div class="alert error"><span class="code">NETWORK</span> — 接口请求失败：${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '对照提交（基准 vs 候选）';
+  }
+});
+
 $('clearBtn').addEventListener('click', async () => {
   deltaEl.value = '';
   dictEl.value = '';
+  candEl.value = '';
   updateCounter(deltaEl, deltaCount, DELTA_LIMIT);
   updateCounter(dictEl, dictCount, DICT_LIMIT);
+  updateCounter(candEl, candCount, DICT_LIMIT);
   $('result').innerHTML = '<div class="placeholder">输入与结论均已清空。</div>';
   try { await fetch('/api/reset', { method: 'POST' }); } catch { /* stateless */ }
   deltaEl.focus();
@@ -262,6 +376,7 @@ $('clearBtn').addEventListener('click', async () => {
 
 updateCounter(deltaEl, deltaCount, DELTA_LIMIT);
 updateCounter(dictEl, dictCount, DICT_LIMIT);
+updateCounter(candEl, candCount, DICT_LIMIT);
 </script>
 </body>
 </html>
