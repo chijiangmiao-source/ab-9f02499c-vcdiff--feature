@@ -115,6 +115,66 @@ async function smokeTest(baseUrl) {
   const resetResp = await fetch(`${baseUrl}/api/reset`, { method: 'POST' });
   expect(resetResp.status === 200, 'POST /api/reset -> 200');
 
+  // --- dictionary comparison: identical candidate ----------------------------
+  const cmpResp = await fetch(`${baseUrl}/api/compare`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      deltaBase64: samples.valid.deltaBase64,
+      dictionaryBase64: samples.dictionaryBase64,
+      candidateDictionaryBase64: samples.dictionaryBase64,
+    }),
+  });
+  const cmp = await cmpResp.json();
+  expect(cmpResp.status === 200 && cmp.ok === true, 'compare identical candidate HTTP 200 ok=true');
+  expect(cmp.baseline?.ok === true && cmp.candidate?.ok === true, 'compare: both sides decoded');
+  expect(cmp.baseline?.sha256 === samples.valid.expectedSha256 &&
+    cmp.candidate?.sha256 === samples.valid.expectedSha256,
+    'compare: both sides reproduce the expected SHA-256');
+  expect(cmp.identical === true && Array.isArray(cmp.differences) && cmp.differences.length === 0,
+    'compare: identical outputs report no difference ranges');
+
+  // --- dictionary comparison: re-exported candidate differs ------------------
+  const reexported = Buffer.from('ABCDEFGHIJKLMNOPQRSTU').toString('base64'); // 21 bytes
+  const cmpDiffResp = await fetch(`${baseUrl}/api/compare`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      deltaBase64: samples.valid.deltaBase64,
+      dictionaryBase64: samples.dictionaryBase64,
+      candidateDictionaryBase64: reexported,
+    }),
+  });
+  const cmpDiff = await cmpDiffResp.json();
+  expect(cmpDiff.identical === false && Array.isArray(cmpDiff.differences),
+    'compare: re-exported candidate reports difference ranges');
+  expect(cmpDiff.differences?.length === 4 &&
+    cmpDiff.differences[0].start === 0 && cmpDiff.differences[0].firstOffset === 0,
+    `compare: first range starts at offset 0 (got ${JSON.stringify(cmpDiff.differences?.[0])})`);
+  expect(cmpDiff.differences?.every((d) => d.firstOffset === d.start &&
+    typeof d.baselineHex === 'string' && typeof d.candidateHex === 'string'),
+    'compare: every range carries firstOffset and both hex digests');
+
+  // --- dictionary comparison: failing candidate keeps the baseline -----------
+  const cmpBadResp = await fetch(`${baseUrl}/api/compare`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      deltaBase64: samples.valid.deltaBase64,
+      dictionaryBase64: samples.dictionaryBase64,
+      candidateDictionaryBase64: Buffer.from('0123456789').toString('base64'), // too short
+    }),
+  });
+  const cmpBad = await cmpBadResp.json();
+  expect(cmpBadResp.status === 200 && cmpBad.ok === true, 'compare with failing candidate still HTTP 200');
+  expect(cmpBad.baseline?.ok === true && cmpBad.baseline?.sha256 === samples.valid.expectedSha256,
+    'compare: baseline conclusion retained when candidate fails');
+  expect(cmpBad.candidate?.ok === false && cmpBad.candidate?.error?.code === 'SOURCE_RANGE' &&
+    typeof cmpBad.candidate?.error?.offset === 'number',
+    `compare: candidate side reports SOURCE_RANGE with offset (got ${cmpBad.candidate?.error?.code})`);
+  expect(cmpBad.identical === null && cmpBad.differences === null,
+    'compare: failed candidate contributes no difference result');
+
   return failures === 0;
 }
 

@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { decodeVcdiff, MAX_OUTPUT_BYTES, MAX_WINDOWS, VcdiffError } from './vcdiff.js';
+import { diffOutputs } from './compare.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PAGE_HTML = readFileSync(join(here, '..', 'static', 'index.html'));
@@ -14,6 +15,7 @@ const PAGE_HTML = readFileSync(join(here, '..', 'static', 'index.html'));
 // Pasted payload limits (checked on the raw Base64 text as well).
 export const MAX_DELTA_BASE64_BYTES = 128 * 1024;
 export const MAX_DICT_BASE64_BYTES = 64 * 1024;
+export const MAX_CANDIDATE_BASE64_BYTES = MAX_DICT_BASE64_BYTES;
 
 const STRICT_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
@@ -60,7 +62,32 @@ function serializeInstruction(ins) {
   return out;
 }
 
-export function handleDecode(rawBody) {
+function serializeWindow(w) {
+  return {
+    index: w.index,
+    windowOffset: w.windowOffset,
+    source: w.source,
+    targetOffset: w.targetOffset,
+    targetLength: w.targetLength,
+    deltaLength: w.deltaLength,
+    sections: w.sections,
+    instructions: w.instructions.map(serializeInstruction),
+  };
+}
+
+function serializeSuccess(result) {
+  return {
+    length: result.length,
+    sha256: createHash('sha256').update(result.output).digest('hex'),
+    windows: result.windows.map(serializeWindow),
+  };
+}
+
+function serializeError(err) {
+  return { code: err.code, message: err.message, offset: err.offset };
+}
+
+function parseJsonBody(rawBody) {
   let parsed;
   try {
     parsed = JSON.parse(rawBody.toString('utf8'));
@@ -70,8 +97,13 @@ export function handleDecode(rawBody) {
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new VcdiffError('BAD_REQUEST', 'request body must be a JSON object');
   }
+  return parsed;
+}
 
-  const { deltaBase64, dictionaryBase64 } = parsed;
+// Validates the shared delta field (request-level: failures reject the whole
+// request with 400/413, exactly like the single-dictionary decode).
+function parseDeltaField(parsed) {
+  const { deltaBase64 } = parsed;
   if (typeof deltaBase64 !== 'string') {
     throw new VcdiffError('BAD_REQUEST', 'field "deltaBase64" is required');
   }
@@ -81,38 +113,144 @@ export function handleDecode(rawBody) {
       `delta Base64 payload exceeds ${MAX_DELTA_BASE64_BYTES} bytes`,
     );
   }
-  const dictText = typeof dictionaryBase64 === 'string' ? dictionaryBase64 : '';
-  if (dictText.length > MAX_DICT_BASE64_BYTES) {
+  return decodeBase64Field(deltaBase64, 'deltaBase64');
+}
+
+// Validates a Base64 dictionary text against its pasted-size limit.
+function parseDictField(text, label, displayName, limit) {
+  if (text.length > limit) {
     throw new VcdiffError(
       'PAYLOAD_TOO_LARGE',
-      `dictionary Base64 payload exceeds ${MAX_DICT_BASE64_BYTES} bytes`,
+      `${displayName} Base64 payload exceeds ${limit} bytes`,
     );
   }
+  return decodeBase64Field(text, label);
+}
 
-  const delta = decodeBase64Field(deltaBase64, 'deltaBase64');
-  const dictionary = decodeBase64Field(dictText, 'dictionaryBase64');
+// Runs the strict decoder for one side of a comparison. A decode failure is
+// captured as the side's structured error; no partial output ever leaves the
+// decoder, so a failed side contributes nothing to the difference result.
+function runSide(delta, dictionary, { includeWindows }) {
+  try {
+    const result = decodeVcdiff(delta, dictionary);
+    const side = {
+      ok: true,
+      length: result.length,
+      sha256: createHash('sha256').update(result.output).digest('hex'),
+    };
+    if (includeWindows) side.windows = result.windows.map(serializeWindow);
+    return { side, output: result.output };
+  } catch (err) {
+    if (err instanceof VcdiffError) {
+      return { side: { ok: false, error: serializeError(err) }, output: null };
+    }
+    throw err;
+  }
+}
+
+export function handleDecode(rawBody) {
+  const parsed = parseJsonBody(rawBody);
+  const delta = parseDeltaField(parsed);
+  const dictText = typeof parsed.dictionaryBase64 === 'string' ? parsed.dictionaryBase64 : '';
+  const dictionary = parseDictField(dictText, 'dictionaryBase64', 'dictionary', MAX_DICT_BASE64_BYTES);
 
   // The decoder either returns the complete output, or throws; on failure no
   // partial output leaves this function.
   const result = decodeVcdiff(delta, dictionary);
 
-  const sha256 = createHash('sha256').update(result.output).digest('hex');
   return {
     ok: true,
-    length: result.length,
-    sha256,
-    windows: result.windows.map((w) => ({
-      index: w.index,
-      windowOffset: w.windowOffset,
-      source: w.source,
-      targetOffset: w.targetOffset,
-      targetLength: w.targetLength,
-      deltaLength: w.deltaLength,
-      sections: w.sections,
-      instructions: w.instructions.map(serializeInstruction),
-    })),
+    ...serializeSuccess(result),
     limits: { maxOutputBytes: MAX_OUTPUT_BYTES, maxWindows: MAX_WINDOWS },
   };
+}
+
+// Dictionary comparison: the same delta is decoded once with the baseline
+// dictionary and once with the candidate dictionary. Request-level problems
+// (bad JSON, missing/oversized/invalid delta, oversized/invalid baseline
+// dictionary) reject the whole request exactly like /api/decode. Candidate
+// dictionary problems (oversized, invalid Base64, decode failure) are
+// reported as the candidate side's structured error instead, so the baseline
+// conclusion stays visible in the same response.
+export function handleCompare(rawBody) {
+  const parsed = parseJsonBody(rawBody);
+  const delta = parseDeltaField(parsed);
+  const dictText = typeof parsed.dictionaryBase64 === 'string' ? parsed.dictionaryBase64 : '';
+  const dictionary = parseDictField(dictText, 'dictionaryBase64', 'dictionary', MAX_DICT_BASE64_BYTES);
+
+  const baseline = runSide(delta, dictionary, { includeWindows: true });
+
+  const candText =
+    typeof parsed.candidateDictionaryBase64 === 'string' ? parsed.candidateDictionaryBase64 : '';
+  let candidate;
+  try {
+    const candidateDict = parseDictField(
+      candText,
+      'candidateDictionaryBase64',
+      'candidate dictionary',
+      MAX_CANDIDATE_BASE64_BYTES,
+    );
+    candidate = runSide(delta, candidateDict, { includeWindows: false });
+  } catch (err) {
+    if (err instanceof VcdiffError) {
+      candidate = { side: { ok: false, error: serializeError(err) }, output: null };
+    } else {
+      throw err;
+    }
+  }
+
+  // Difference ranges only exist when both sides decoded successfully; a
+  // failed candidate never contributes bytes to the comparison.
+  let identical = null;
+  let differences = null;
+  if (baseline.output !== null && candidate.output !== null) {
+    const diff = diffOutputs(baseline.output, candidate.output);
+    identical = diff.identical;
+    differences = diff.ranges;
+  }
+
+  return {
+    ok: true,
+    baseline: baseline.side,
+    candidate: candidate.side,
+    identical,
+    differences,
+    limits: { maxOutputBytes: MAX_OUTPUT_BYTES, maxWindows: MAX_WINDOWS },
+  };
+}
+
+// Reads a JSON POST body (bounded per endpoint) and runs the handler,
+// mapping VcdiffError to the standard error response shape.
+function handleJsonPost(req, res, maxBodyBytes, handler) {
+  const chunks = [];
+  let size = 0;
+  req.on('data', (chunk) => {
+    size += chunk.length;
+    // Bound the raw JSON body generously above the field limits.
+    if (size > maxBodyBytes) {
+      req.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on('end', () => {
+    try {
+      const answer = handler(Buffer.concat(chunks));
+      return json(res, 200, answer);
+    } catch (err) {
+      if (err instanceof VcdiffError) {
+        const status = err.code === 'PAYLOAD_TOO_LARGE' ? 413 : 400;
+        return json(res, status, {
+          ok: false,
+          error: { code: err.code, message: err.message, offset: err.offset },
+        });
+      }
+      return json(res, 500, {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'internal error', offset: null },
+      });
+    }
+  });
 }
 
 export function createApp() {
@@ -133,36 +271,21 @@ export function createApp() {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/decode') {
-      const chunks = [];
-      let size = 0;
-      req.on('data', (chunk) => {
-        size += chunk.length;
-        // Bound the raw JSON body generously above the field limits.
-        if (size > MAX_DELTA_BASE64_BYTES + MAX_DICT_BASE64_BYTES + 4096) {
-          req.destroy();
-          return;
-        }
-        chunks.push(chunk);
-      });
-      req.on('end', () => {
-        try {
-          const answer = handleDecode(Buffer.concat(chunks));
-          return json(res, 200, answer);
-        } catch (err) {
-          if (err instanceof VcdiffError) {
-            const status = err.code === 'PAYLOAD_TOO_LARGE' ? 413 : 400;
-            return json(res, status, {
-              ok: false,
-              error: { code: err.code, message: err.message, offset: err.offset },
-            });
-          }
-          return json(res, 500, {
-            ok: false,
-            error: { code: 'INTERNAL', message: 'internal error', offset: null },
-          });
-        }
-      });
-      return;
+      return handleJsonPost(
+        req,
+        res,
+        MAX_DELTA_BASE64_BYTES + MAX_DICT_BASE64_BYTES + 4096,
+        handleDecode,
+      );
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/compare') {
+      return handleJsonPost(
+        req,
+        res,
+        MAX_DELTA_BASE64_BYTES + MAX_DICT_BASE64_BYTES + MAX_CANDIDATE_BASE64_BYTES + 4096,
+        handleCompare,
+      );
     }
 
     if (req.method === 'POST' && url.pathname === '/api/reset') {

@@ -10,6 +10,13 @@
 - 失败时给出错误码与**首个原始偏移**，且不保留任何部分输出；
 - 可一键清空输入与结论。
 
+另可粘贴**候选 Base64 字典**（≤ 64 KiB）做一次对照提交：系统以**同一增量载荷**
+分别用基准字典与候选字典运行同一严格解码，并列展示两侧输出长度、SHA-256 与是否
+完全一致；两侧都成功时按最终输出偏移给出连续差异区间（含两侧字节的 hex 摘要与
+每个区间的首个不同位置），完全一致时明确显示无差异。候选字典超限、Base64 非法或
+使流解码失败时，只报告候选侧的结构化错误与原始偏移，基准侧结论保留，且候选侧
+任何部分输出都不会被当作差异结果。
+
 ## 严格接受规则（RFC 3284）
 
 | 规则 | 实现 |
@@ -31,10 +38,12 @@
 
 ```
 src/vcdiff.js          RFC 3284 严格解码器（默认码表、地址缓存、证据收集）
-src/server.js          零依赖 HTTP 服务（/healthz、/、/api/decode、/api/reset）
+src/compare.js         两侧最终输出的连续差异区间计算（hex 摘要、首个不同位置）
+src/server.js          零依赖 HTTP 服务（/healthz、/、/api/decode、/api/compare、/api/reset）
 static/index.html      校验台页面（原生 JS，无外部资源）
 test/vcdiff.test.js    解码器单元/拒绝用例（50 项）
 test/server.test.js    接口测试
+test/compare.test.js   差异计算与字典对照接口测试
 test/helpers/encoder.js 测试用最小 VCDIFF 编码器（可构造畸形流）
 fixtures/golden/       open-vcdiff 参考实现生成的黄金向量（7 组）
 fixtures/samples.json  页面/冒烟所用样本（含失败偏移）
@@ -109,5 +118,45 @@ echo "exit=$?"
 ```json
 { "ok": false, "error": { "code": "COPY_NOT_GENERATED", "message": "…", "offset": 39 } }
 ```
+
+`POST /api/compare`
+
+```json
+{
+  "deltaBase64": "1sPExAAAAA...",
+  "dictionaryBase64": "",
+  "candidateDictionaryBase64": ""
+}
+```
+
+同一载荷分别以基准字典与候选字典运行严格解码。请求级问题（JSON 非法、载荷缺失 /
+超限 / Base64 非法、基准字典超限 / Base64 非法）与 `/api/decode` 一样以 `400/413`
+拒绝；候选字典的超限、Base64 非法或解码失败则只作为候选侧结构化错误出现在
+`200` 响应中，基准侧结论保留。成功 `200`：
+
+```json
+{
+  "ok": true,
+  "baseline": { "ok": true, "length": 37, "sha256": "ddd5ab03…", "windows": [ … ] },
+  "candidate": { "ok": true, "length": 37, "sha256": "1b9f2c…" },
+  "identical": false,
+  "differences": [
+    { "start": 0, "end": 11, "firstOffset": 0,
+      "baselineHex": "303132333435363738392d", "candidateHex": "4142434445464748494a4b",
+      "baselineHexTruncated": false, "candidateHexTruncated": false }
+  ],
+  "limits": { "maxOutputBytes": 524288, "maxWindows": 8 }
+}
+```
+
+- `baseline` 含完整窗口证据（同 `/api/decode` 成功响应）；`candidate` 成功时给出
+  长度与 SHA-256。
+- `identical` 为两侧输出是否完全一致；`differences` 为按最终输出偏移排序的连续
+  差异区间，每个区间给出两侧字节的 hex 摘要（每侧至多 64 字节，超出时对应
+  `*HexTruncated` 为 `true`）与该区间的首个不同位置 `firstOffset`；完全一致时
+  `identical: true` 且 `differences: []`。
+- 任一侧失败时该侧为 `{ "ok": false, "error": { "code", "message", "offset" } }`，
+  且 `identical` 与 `differences` 均为 `null`——失败侧的任何部分输出都不会被
+  当作差异结果。
 
 另有 `GET /healthz → {"status":"ok"}` 与 `POST /api/reset → {"ok":true}`。

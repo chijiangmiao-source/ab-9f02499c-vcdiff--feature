@@ -63,8 +63,19 @@
   .alert { border-radius: 9px; padding: 13px 16px; margin-bottom: 14px; font-size: 13.5px; }
   .alert.error { background: #3a1d24; border: 1px solid #6e2c38; color: #ffc4c4; }
   .alert.ok { background: #173024; border: 1px solid #27613f; color: #baf3d5; }
+  .alert.warn { background: #3a2f1e; border: 1px solid #6e542c; color: #ffe1b3; }
   .alert .code { font-family: var(--mono); color: #ff9b9b; font-weight: 700; }
   .offset-pill { font-family: var(--mono); background: #0d1226; border: 1px solid #6e2c38; border-radius: 6px; padding: 1px 8px; }
+  .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+  @media (max-width: 720px) { .compare-grid { grid-template-columns: 1fr; } }
+  .sidepanel { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .sidepanel h3 { margin: 0 0 8px; font-size: 12.5px; color: var(--accent); letter-spacing: .3px; }
+  .sidepanel .stat { margin-bottom: 8px; }
+  .sidepanel .stat:last-child { margin-bottom: 0; }
+  .sidepanel .alert { margin-bottom: 0; }
+  .sidepanel .alert .code { font-size: 12.5px; }
+  .diffhead { margin: 4px 0 10px; font-size: 13px; color: var(--txt); }
+  .sech { margin: 18px 0 10px; font-size: 13px; color: var(--accent); letter-spacing: .3px; }
   .muted { color: var(--muted); font-size: 12px; }
   details.sec { margin-top: 6px; }
   details.sec summary { cursor: pointer; color: var(--muted); font-size: 12px; }
@@ -73,7 +84,7 @@
 <body>
 <header>
   <h1>深空归档 · 增量标定片导入校验台</h1>
-  <p>粘贴 Base64 VCDIFF 载荷与基准字典，按 RFC 3284 默认码表解码，核验最终长度 / SHA-256 / 窗口源区间 / 指令证据。解码失败时报告首个原始偏移且不保留任何部分输出。</p>
+  <p>粘贴 Base64 VCDIFF 载荷与基准字典，按 RFC 3284 默认码表解码，核验最终长度 / SHA-256 / 窗口源区间 / 指令证据。解码失败时报告首个原始偏移且不保留任何部分输出。可另粘贴候选字典做一次对照提交：系统以同一载荷分别运行严格解码，比较两侧最终输出。</p>
 </header>
 
 <main>
@@ -88,8 +99,13 @@
         <span class="lbl"><span>Base64 基准字典（≤ 64 KiB，可留空）</span><span id="dictCount">0 B</span></span>
         <textarea id="dict" spellcheck="false" placeholder="SOURCE 窗口使用的基准字典字节的 Base64" autocomplete="off"></textarea>
       </label>
+      <label class="field">
+        <span class="lbl"><span>候选 Base64 字典（≤ 64 KiB，可留空，仅对照用）</span><span id="candCount">0 B</span></span>
+        <textarea id="candDict" spellcheck="false" placeholder="疑似重新导出的候选字典字节的 Base64；原始增量载荷保持不变" autocomplete="off"></textarea>
+      </label>
       <div class="btns">
         <button type="submit" class="primary" id="submitBtn">提交真实接口校验</button>
+        <button type="button" class="primary" id="compareBtn">提交字典对照</button>
         <button type="button" class="ghost" id="clearBtn">清空输入与结论</button>
       </div>
     </form>
@@ -99,20 +115,21 @@
       <li>整数必须最短编码；三段长度须精确吻合</li>
       <li>COPY 仅允许读取 SOURCE / 前序 TARGET 或当前窗口已生成字节</li>
       <li>地址缓存按窗口维护：<code>SELF / HERE / NEAR×4 / SAME×3</code></li>
+      <li>字典对照：同一载荷分别以基准 / 候选字典解码，比较最终输出长度、SHA-256 与连续差异区间；候选侧失败只报告其结构化错误，基准侧结论保留</li>
     </ul>
   </section>
 
   <section class="card" id="resultcard">
     <h2>接口结论</h2>
-    <div id="result"><div class="placeholder">尚未提交。校验结果、窗口源区间与 ADD / RUN / COPY 证据将在此按指令顺序列出。</div></div>
+    <div id="result"><div class="placeholder">尚未提交。校验结果、窗口源区间与 ADD / RUN / COPY 证据将在此按指令顺序列出；字典对照会并列展示两侧长度、SHA-256 与差异区间。</div></div>
   </section>
 </main>
 
 <script>
 'use strict';
 const $ = (id) => document.getElementById(id);
-const deltaEl = $('delta'), dictEl = $('dict');
-const deltaCount = $('deltaCount'), dictCount = $('dictCount');
+const deltaEl = $('delta'), dictEl = $('dict'), candEl = $('candDict');
+const deltaCount = $('deltaCount'), dictCount = $('dictCount'), candCount = $('candCount');
 
 const DELTA_LIMIT = 128 * 1024;
 const DICT_LIMIT = 64 * 1024;
@@ -125,6 +142,7 @@ function updateCounter(el, counter, limit) {
 }
 deltaEl.addEventListener('input', () => updateCounter(deltaEl, deltaCount, DELTA_LIMIT));
 dictEl.addEventListener('input', () => updateCounter(dictEl, dictCount, DICT_LIMIT));
+candEl.addEventListener('input', () => updateCounter(candEl, candCount, DICT_LIMIT));
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
@@ -215,6 +233,85 @@ function renderError(payload) {
   </div>`;
 }
 
+// --- dictionary comparison rendering ---------------------------------------
+
+function renderSidePanel(title, side) {
+  if (side.ok) {
+    return `
+    <div class="sidepanel">
+      <h3>${esc(title)}</h3>
+      <div class="stat"><div class="k">最终字节长度</div><div class="v">${side.length.toLocaleString('en')}</div></div>
+      <div class="stat"><div class="k">SHA-256</div><div class="v" style="font-size:11.5px">${esc(side.sha256)}</div></div>
+    </div>`;
+  }
+  const e = side.error || {};
+  const off = (e.offset === null || e.offset === undefined)
+    ? '原始偏移不适用' : `<span class="offset-pill">首个原始偏移 ${e.offset} (0x${Number(e.offset).toString(16)})</span>`;
+  return `
+  <div class="sidepanel">
+    <h3>${esc(title)}</h3>
+    <div class="alert error">
+      <div style="margin-bottom:6px">✗ <span class="code">${esc(e.code || 'ERROR')}</span> — ${esc(e.message || '解码失败')}</div>
+      <div>${off} <span class="muted">该侧未产生任何输出。</span></div>
+    </div>
+  </div>`;
+}
+
+function renderDiffTable(differences) {
+  const rows = differences.map((d) => {
+    const bHex = esc(d.baselineHex) + (d.baselineHexTruncated ? '…' : '');
+    const cHex = esc(d.candidateHex) + (d.candidateHexTruncated ? '…' : '');
+    return `<tr>
+      <td class="hex">[${d.start}, ${d.end})</td>
+      <td class="num">${d.end - d.start}</td>
+      <td class="num">${d.firstOffset}</td>
+      <td class="hex">${bHex || '<span class="muted">（无字节）</span>'}</td>
+      <td class="hex">${cHex || '<span class="muted">（无字节）</span>'}</td>
+    </tr>`;
+  }).join('');
+  return `
+  <table>
+    <thead><tr>
+      <th>差异区间（最终输出偏移）</th><th>长度</th><th>首个不同位置</th><th>基准侧字节 hex</th><th>候选侧字节 hex</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function renderCompare(data) {
+  const parts = [];
+  const bothOk = data.baseline.ok && data.candidate.ok;
+
+  if (bothOk && data.identical === true) {
+    parts.push(`<div class="alert ok">✓ 对照完成：两侧输出<strong>完全一致，无差异</strong>（各 ${data.baseline.length.toLocaleString('en')} 字节，SHA-256 相同）。候选字典不改变复原结果。</div>`);
+  } else if (bothOk) {
+    const n = data.differences.length;
+    const first = data.differences[0];
+    parts.push(`<div class="alert warn">✗ 对照完成：两侧输出<strong>不一致</strong>，共 ${n.toLocaleString('en')} 个连续差异区间，首个不同位置 ${first.firstOffset} (0x${first.firstOffset.toString(16)})。</div>`);
+  } else {
+    const failed = [];
+    if (!data.baseline.ok) failed.push('基准侧');
+    if (!data.candidate.ok) failed.push('候选侧');
+    parts.push(`<div class="alert error">✗ ${failed.join('与')}未成功解码，<strong>不进行字节对照</strong>；下方仅保留各侧自身的结构化结论，候选侧任何部分输出都不会作为差异结果。</div>`);
+  }
+
+  parts.push('<div class="compare-grid">');
+  parts.push(renderSidePanel('基准字典侧', data.baseline));
+  parts.push(renderSidePanel('候选字典侧', data.candidate));
+  parts.push('</div>');
+
+  if (bothOk && data.identical === false) {
+    parts.push('<div class="diffhead">连续差异区间（按最终输出偏移，hex 摘要每侧至多 64 字节，超出以 … 标记）：</div>');
+    parts.push(renderDiffTable(data.differences));
+  }
+
+  if (data.baseline.ok) {
+    parts.push('<div class="sech">基准侧窗口证据（与单字典校验一致）</div>');
+    parts.push(data.baseline.windows.map(renderWindow).join(''));
+  }
+  return parts.join('');
+}
+
 $('form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const btn = $('submitBtn');
@@ -250,11 +347,55 @@ $('form').addEventListener('submit', async (ev) => {
   }
 });
 
+$('compareBtn').addEventListener('click', async () => {
+  const btn = $('compareBtn');
+  const deltaB64 = deltaEl.value.trim();
+  const dictB64 = dictEl.value.trim();
+  const candB64 = candEl.value.trim();
+
+  if (deltaB64.length === 0) {
+    $('result').innerHTML = '<div class="alert error"><span class="code">BAD_REQUEST</span> — 请粘贴 VCDIFF 载荷。</div>';
+    return;
+  }
+  // The candidate text is sent as-is: an oversized or malformed candidate is
+  // reported by the interface as the candidate side's structured error while
+  // the baseline conclusion stays visible.
+  if (deltaB64.length > DELTA_LIMIT || dictB64.length > DICT_LIMIT) {
+    $('result').innerHTML = '<div class="alert error"><span class="code">PAYLOAD_TOO_LARGE</span> — 载荷或基准字典超过页面允许长度。</div>';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = '对照中…';
+  $('result').innerHTML = '<div class="placeholder">正在调用 /api/compare …</div>';
+  try {
+    const resp = await fetch('/api/compare', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        deltaBase64: deltaB64,
+        dictionaryBase64: dictB64,
+        candidateDictionaryBase64: candB64,
+      }),
+    });
+    const data = await resp.json();
+    $('result').innerHTML = data.ok ? renderCompare(data) : renderError(data);
+  } catch (err) {
+    $('result').innerHTML =
+      `<div class="alert error"><span class="code">NETWORK</span> — 接口请求失败：${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '提交字典对照';
+  }
+});
+
 $('clearBtn').addEventListener('click', async () => {
   deltaEl.value = '';
   dictEl.value = '';
+  candEl.value = '';
   updateCounter(deltaEl, deltaCount, DELTA_LIMIT);
   updateCounter(dictEl, dictCount, DICT_LIMIT);
+  updateCounter(candEl, candCount, DICT_LIMIT);
   $('result').innerHTML = '<div class="placeholder">输入与结论均已清空。</div>';
   try { await fetch('/api/reset', { method: 'POST' }); } catch { /* stateless */ }
   deltaEl.focus();
@@ -262,6 +403,7 @@ $('clearBtn').addEventListener('click', async () => {
 
 updateCounter(deltaEl, deltaCount, DELTA_LIMIT);
 updateCounter(dictEl, dictCount, DICT_LIMIT);
+updateCounter(candEl, candCount, DICT_LIMIT);
 </script>
 </body>
 </html>
